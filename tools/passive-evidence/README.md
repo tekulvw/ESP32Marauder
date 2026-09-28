@@ -1,6 +1,6 @@
 # Passive evidence serial protocol v1
 
-Transport: UART0 at 115200 8N1. One UTF-8 JSON object per line, prefixed `@WARD:`. Console chatter and GPS NMEA may be interleaved between complete lines. Payload bytes are hex encoded, so radio content cannot inject a console command or JSON line. The host retains the raw serial capture.
+Transport: native USB Serial/JTAG CDC when built with CDC-on-boot enabled, otherwise UART0 at 115200 8N1. Native USB still uses a serial device API, but its data rate is not limited by the nominal baud value. The `started.transport` field records `usb_serial_jtag` or `uart0`. One UTF-8 JSON object per line, prefixed `@WARD:`. Console chatter and GPS NMEA may be interleaved between complete lines. Payload bytes are hex encoded, so radio content cannot inject a console command or JSON line. The host retains the raw serial capture.
 
 ## Commands and lifecycle
 
@@ -32,7 +32,7 @@ The schedule is Wi-Fi channels `11,6,1,10,9,8,7,5,4,3,2`, targeting 250 ms per c
 
 `status` reports `device_us`, `seen` (packets offered to the queue after beacon sampling), `dropped` (queue-full losses), `queued`, and `beacon_suppressed` (deliberately sampled repeats), approximately every two seconds and at stop. The 32-record queue is bounded. RF/controller losses before callbacks are unmeasured. Host status adds `host_sequence_gaps`, which overlaps device drops and must not be summed with them.
 
-At 115200 baud the serial stream can saturate. Observe the counters before choosing a faster transport. No packet payload is written to SD by this new mode yet; the connected host is the recorder. The existing SD wardrive/PCAP modes remain separate.
+At 115200 baud the UART stream can saturate. The project native-USB build uses a 4096-byte TX and 1024-byte RX ring buffer. C5 USB owns GPIO13/14, so this build moves GPS TX -> C5 GPIO4 (RX) and GPS RX <- C5 GPIO5 (TX); physically rewire those signals with power removed. UART-only builds retain the original GPS GPIO14/13 mapping. Observe the counters before choosing a faster transport. No packet payload is written to SD by this new mode yet; the connected host is the recorder. The existing SD wardrive/PCAP modes remain separate.
 
 ## GPS and interpretation
 

@@ -11,6 +11,11 @@ extern WiFiScan wifi_scan_obj;
 namespace passive_evidence {
 namespace {
 constexpr size_t MAX_BYTES = 1024;
+#if ARDUINO_USB_CDC_ON_BOOT
+constexpr const char* TRANSPORT = "usb_serial_jtag";
+#else
+constexpr const char* TRANSPORT = "uart0";
+#endif
 constexpr uint8_t CHANNELS[] = {11, 6, 1, 10, 9, 8, 7, 5, 4, 3, 2};
 struct Record {
   uint64_t us;
@@ -173,7 +178,7 @@ void start() {
   scan->setInterval(50); scan->setWindow(50); scan->setMaxResults(0); scan->setDuplicateFilter(0);
   if (!wifiWindow()) { release(); error("Cannot set passive Wi-Fi channel"); return; }
   running=true; acceptingSet(true); statusAt=now();
-  header("started"); Serial.println(",\"mode\":\"passive-2.4-ble\",\"max_payload\":1024,\"wifi_frame_types\":[\"probe_request\",\"beacon\",\"probe_response\"],\"beacon_sample_ms\":5000}");
+  header("started"); Serial.printf(",\"mode\":\"passive-2.4-ble\",\"max_payload\":1024,\"wifi_frame_types\":[\"probe_request\",\"beacon\",\"probe_response\"],\"beacon_sample_ms\":5000,\"transport\":\"%s\"}\n", TRANSPORT);
 }
 }  // namespace
 bool active() { return running; }

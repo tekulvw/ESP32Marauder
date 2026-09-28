@@ -245,6 +245,12 @@ void setup()
     esp_spiram_init();
   #endif
 
+  #if defined(MARAUDER_C5) && ARDUINO_USB_CDC_ON_BOOT
+    // A complete evidence line fits in the USB ring buffer. The CDC transport
+    // does not use the UART baud rate; retain it for console compatibility.
+    Serial.setTxBufferSize(4096);
+    Serial.setRxBufferSize(1024);
+  #endif
   Serial.begin(115200);
 
   #ifdef HAS_ACT_LED

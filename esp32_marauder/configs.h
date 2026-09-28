@@ -2850,8 +2850,15 @@
       #define GPS_RX 11 // External GPS RX -> T-Dongle UART0 TX
     #elif defined(MARAUDER_C5)
       #define GPS_SERIAL_INDEX 1
-      #define GPS_TX 14
-      #define GPS_RX 13
+      #if ARDUINO_USB_CDC_ON_BOOT
+        // These names are from the GPS perspective: Serial.begin takes RX, TX.
+        // Native USB owns GPIO13/D- and GPIO14/D+; move the GPS signal wires.
+        #define GPS_TX 4 // GPS TX -> C5 RX
+        #define GPS_RX 5 // GPS RX <- C5 TX
+      #else
+        #define GPS_TX 14
+        #define GPS_RX 13
+      #endif
     #elif defined(MARAUDER_V8)
       #define GPS_SERIAL_INDEX 1
       #define GPS_TX 14
