@@ -11,6 +11,8 @@ extern WiFiScan wifi_scan_obj;
 namespace passive_evidence {
 namespace {
 constexpr size_t MAX_BYTES = 1024;
+constexpr unsigned DRAIN_PACKET_LIMIT = 16;
+constexpr uint64_t DRAIN_BUDGET_US = 4000;
 #if ARDUINO_USB_CDC_ON_BOOT
 constexpr unsigned QUEUE_CAPACITY = 64;
 constexpr const char* TRANSPORT = "usb_serial_jtag";
@@ -104,9 +106,12 @@ class Callbacks : public NimBLEScanCallbacks {
   }
 };
 Callbacks callbacks;
-void drain(unsigned limit) {
+void drain(unsigned limit, uint64_t budgetUs = 0) {
   Record record;
-  while (limit--) {
+  const uint64_t started = now();
+  // Check between complete packets: an individual serial write may block longer
+  // under backpressure. A zero budget is reserved for the final stop drain.
+  while (limit-- && (!budgetUs || now() - started < budgetUs)) {
     portENTER_CRITICAL(&guard);
     bool available = pool.pop(record, record.bytes, sizeof(record.bytes));
     portEXIT_CRITICAL(&guard);
@@ -233,8 +238,8 @@ bool command(const String& input) {
 }
 void tick() {
   if (!running) return;
-  // Bounded draining keeps command processing and GPS polling responsive.
-  drain(2);
+  // Bound each batch by elapsed time and count, then return to commands/GPS.
+  drain(DRAIN_PACKET_LIMIT, DRAIN_BUDGET_US);
   uint64_t current=now();
   if (current-windowStart >= (bleWindow ? 500000 : 250000)) {
     acceptingSet(false);

@@ -503,7 +503,11 @@ void loop()
     led_obj.main(currentTime);
   #endif
 
-  #ifdef HAS_SCREEN
+  #if defined(MARAUDER_C5) && !defined(HAS_SCREEN)
+    // Passive evidence must not inherit the screenless UI's 50 ms idle pacing.
+    // One RTOS tick (1 ms in the pinned C5 core) still yields to radio/OS tasks.
+    delay(passive_evidence::active() ? 1 : 50);
+  #elif defined(HAS_SCREEN)
     delay(1);
   #else
     delay(50);
