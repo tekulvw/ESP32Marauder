@@ -10,11 +10,11 @@ extern WiFiScan wifi_scan_obj;
 
 namespace passive_evidence {
 namespace {
-constexpr size_t MAX_BYTES = 384;
+constexpr size_t MAX_BYTES = 1024;
 constexpr uint8_t CHANNELS[] = {11, 6, 1, 10, 9, 8, 7, 5, 4, 3, 2};
 struct Record {
   uint64_t us;
-  uint32_t seq;
+  uint32_t seq, beaconHash;
   uint16_t len, original;
   int8_t rssi;
   uint8_t radio, channel, addressType, advType;
@@ -29,7 +29,8 @@ bool wifiReady = false;
 bool bleReady = false;
 bool bleWindow = false;
 bool windowOpen = false;
-uint32_t seen = 0, dropped = 0;
+uint32_t seen = 0, dropped = 0, beaconSuppressed = 0;
+BeaconSampler beaconSampler;
 uint32_t stream = 0;
 uint64_t windowStart = 0, statusAt = 0;
 uint8_t channelIndex = 0;
@@ -45,21 +46,28 @@ void error(const char* reason) {
 void enqueue(Record& record) {
   portENTER_CRITICAL(&guard);
   if (accepting) {
-    record.seq = ++seen;
-    if (xQueueSend(queue, &record, 0) != pdTRUE) ++dropped;
+    bool beacon = record.radio == 0 && record.bytes[0] == 0x80;
+    if (beacon && beaconSampler.suppress(record.bytes+10, record.channel, record.beaconHash, record.us)) {
+      ++beaconSuppressed;
+    } else {
+      record.seq = ++seen;
+      if (xQueueSend(queue, &record, 0) != pdTRUE) ++dropped;
+      else if (beacon) beaconSampler.remember(record.bytes+10, record.channel, record.beaconHash, record.us);
+    }
   }
   portEXIT_CRITICAL(&guard);
 }
 void wifiCallback(void* buffer, wifi_promiscuous_pkt_type_t type) {
   if (type != WIFI_PKT_MGMT) return;
   auto packet = static_cast<wifi_promiscuous_pkt_t*>(buffer);
-  size_t len = probeLength(packet->payload, packet->rx_ctrl.sig_len);
+  size_t len = managementLength(packet->payload, packet->rx_ctrl.sig_len);
   if (!len) return;
   Record record{};
   record.us = now(); record.radio = 0;
   record.rssi = packet->rx_ctrl.rssi; record.channel = packet->rx_ctrl.channel;
   record.original = len; record.len = len < MAX_BYTES ? len : MAX_BYTES;
   memcpy(record.bytes, packet->payload, record.len);
+  if (record.bytes[0] == 0x80) record.beaconHash = beaconFingerprint(packet->payload, len);
   enqueue(record);
 }
 class Callbacks : public NimBLEScanCallbacks {
@@ -87,7 +95,7 @@ void drain(unsigned limit) {
     if (record.radio) {
       Serial.printf(",\"mac\":\"%02x:%02x:%02x:%02x:%02x:%02x\",\"address_type\":%u,\"adv_type\":%u",
         record.mac[0],record.mac[1],record.mac[2],record.mac[3],record.mac[4],record.mac[5],record.addressType,record.advType);
-    } else Serial.printf(",\"channel\":%u", record.channel);
+    } else Serial.printf(",\"channel\":%u,\"frame_type\":\"%s\"", record.channel, frameType(record.bytes));
     Serial.print(",\"payload\":\"");
     char hex[MAX_BYTES * 2 + 1];
     const char* digits = "0123456789abcdef";
@@ -96,11 +104,11 @@ void drain(unsigned limit) {
   }
 }
 void status() {
-  uint32_t count, lost;
-  portENTER_CRITICAL(&guard); count=seen; lost=dropped; portEXIT_CRITICAL(&guard);
+  uint32_t count, lost, suppressed;
+  portENTER_CRITICAL(&guard); count=seen; lost=dropped; suppressed=beaconSuppressed; portEXIT_CRITICAL(&guard);
   header("status");
-  Serial.printf(",\"device_us\":%llu,\"seen\":%lu,\"dropped\":%lu,\"queued\":%u}\n",
-    now(), (unsigned long)count, (unsigned long)lost, (unsigned)uxQueueMessagesWaiting(queue));
+  Serial.printf(",\"device_us\":%llu,\"seen\":%lu,\"dropped\":%lu,\"queued\":%u,\"beacon_suppressed\":%lu}\n",
+    now(), (unsigned long)count, (unsigned long)lost, (unsigned)uxQueueMessagesWaiting(queue), (unsigned long)suppressed);
 }
 void coverage(uint64_t end) {
   if (!windowOpen) return;
@@ -147,7 +155,7 @@ void start() {
   wifi_scan_obj.shutdownWiFi();
   if (!queue) queue=xQueueCreate(32, sizeof(Record));
   if (!queue) { error("Cannot allocate evidence queue"); return; }
-  xQueueReset(queue); seen=0; dropped=0; stream=esp_random();
+  xQueueReset(queue); seen=0; dropped=0; beaconSuppressed=0; beaconSampler.reset(); stream=esp_random();
   channelIndex=0; bleWindow=false; windowOpen=false;
   wifi_init_config_t config=WIFI_INIT_CONFIG_DEFAULT();
   if (esp_wifi_init(&config) != ESP_OK) { error("Wi-Fi initialization failed"); return; }
@@ -165,7 +173,7 @@ void start() {
   scan->setInterval(50); scan->setWindow(50); scan->setMaxResults(0); scan->setDuplicateFilter(0);
   if (!wifiWindow()) { release(); error("Cannot set passive Wi-Fi channel"); return; }
   running=true; acceptingSet(true); statusAt=now();
-  header("started"); Serial.println(",\"mode\":\"passive-2.4-ble\",\"max_payload\":384}");
+  header("started"); Serial.println(",\"mode\":\"passive-2.4-ble\",\"max_payload\":1024,\"wifi_frame_types\":[\"probe_request\",\"beacon\",\"probe_response\"],\"beacon_sample_ms\":5000}");
 }
 }  // namespace
 bool active() { return running; }
@@ -174,7 +182,7 @@ bool command(const String& input) {
     String tx=input.substring(14);
     if (!tx.length() || tx.length()>40) return true;
     for (size_t i=0; i<tx.length(); ++i) if (!isAlphaNumeric(tx[i])) return true;
-    Serial.printf("@WARD:{\"v\":1,\"event\":\"capabilities\",\"tx\":\"%s\",\"passive\":true,\"wifi_probe\":true,\"ble_advertisement\":true}\n", tx.c_str());
+    Serial.printf("@WARD:{\"v\":1,\"event\":\"capabilities\",\"tx\":\"%s\",\"passive\":true,\"wifi_probe\":true,\"wifi_beacon\":true,\"wifi_probe_response\":true,\"ble_advertisement\":true}\n", tx.c_str());
     return true;
   }
   if (input=="evidence start") { start(); return true; }
