@@ -30,7 +30,7 @@ struct RecordHeader {
   int8_t rssi;
   uint8_t radio, channel, addressType, advType;
   uint8_t mac[6];
-  uint8_t reserved;
+  uint8_t headerOnly;
 };
 struct Record : RecordHeader { uint8_t bytes[MAX_BYTES]; };
 using EvidencePool = PacketPool<RecordHeader, POOL_BYTES, QUEUE_CAPACITY, MAX_BYTES>;
@@ -45,6 +45,8 @@ bool windowOpen = false;
 uint32_t seen = 0, dropped = 0, beaconSuppressed = 0;
 uint32_t droppedRecords = 0, droppedBytes = 0, droppedInvalid = 0;
 BeaconSampler beaconSampler;
+HeaderSampler headerSampler;
+uint32_t headersSeen=0, headersSuppressed=0, headersLimited=0, headersQueued=0;
 uint32_t stream = 0;
 uint64_t windowStart = 0, statusAt = 0;
 uint8_t channelIndex = 0;
@@ -61,6 +63,16 @@ void enqueue(Record& record) {
   portENTER_CRITICAL(&guard);
   if (accepting) {
     bool beacon = record.radio == 0 && record.bytes[0] == 0x80;
+    if (record.headerOnly) {
+      ++headersSeen;
+      if (headerSampler.suppress(record.beaconHash,record.us)) {
+        ++headersSuppressed; portEXIT_CRITICAL(&guard); return;
+      }
+      // Preserve at least half the record slots for probes/AP IEs/BLE.
+      if (headerSampler.limited(record.us) || pool.count()>=QUEUE_CAPACITY/2) {
+        ++headersLimited; portEXIT_CRITICAL(&guard); return;
+      }
+    }
     if (beacon && beaconSampler.suppress(record.bytes+10, record.channel, record.beaconHash, record.us)) {
       ++beaconSuppressed;
     } else {
@@ -71,6 +83,8 @@ void enqueue(Record& record) {
         if (result == PoolPush::RecordLimit) ++droppedRecords;
         else if (result == PoolPush::ByteLimit) ++droppedBytes;
         else ++droppedInvalid;
+      } else if (record.headerOnly) {
+        headerSampler.remember(record.beaconHash,record.us); ++headersQueued;
       } else if (beacon) {
         beaconSampler.remember(record.bytes+10, record.channel, record.beaconHash, record.us);
       }
@@ -79,16 +93,21 @@ void enqueue(Record& record) {
   portEXIT_CRITICAL(&guard);
 }
 void wifiCallback(void* buffer, wifi_promiscuous_pkt_type_t type) {
-  if (type != WIFI_PKT_MGMT) return;
+  if (type != WIFI_PKT_MGMT && type != WIFI_PKT_DATA) return;
   auto packet = static_cast<wifi_promiscuous_pkt_t*>(buffer);
-  size_t len = managementLength(packet->payload, packet->rx_ctrl.sig_len);
+  if (packet->rx_ctrl.rx_state) return;
+  size_t len = type==WIFI_PKT_MGMT ? managementLength(packet->payload, packet->rx_ctrl.sig_len) : 0;
+  bool headerOnly=!len;
+  if (headerOnly) len=evidenceHeaderLength(packet->payload,packet->rx_ctrl.sig_len);
   if (!len) return;
   Record record{};
   record.us = now(); record.radio = 0;
   record.rssi = packet->rx_ctrl.rssi; record.channel = packet->rx_ctrl.channel;
-  record.original = len; record.len = len < MAX_BYTES ? len : MAX_BYTES;
+  record.headerOnly=headerOnly;
+  record.original = packet->rx_ctrl.sig_len-4; record.len = len < MAX_BYTES ? len : MAX_BYTES;
   memcpy(record.bytes, packet->payload, record.len);
-  if (record.bytes[0] == 0x80) record.beaconHash = beaconFingerprint(packet->payload, len);
+  if (headerOnly) record.beaconHash=headerFingerprint(record.bytes,record.len,record.channel);
+  else if (record.bytes[0] == 0x80) record.beaconHash = beaconFingerprint(packet->payload, len);
   enqueue(record);
 }
 class Callbacks : public NimBLEScanCallbacks {
@@ -123,7 +142,8 @@ void drain(unsigned limit, uint64_t budgetUs = 0) {
     if (record.radio) {
       Serial.printf(",\"mac\":\"%02x:%02x:%02x:%02x:%02x:%02x\",\"address_type\":%u,\"adv_type\":%u",
         record.mac[0],record.mac[1],record.mac[2],record.mac[3],record.mac[4],record.mac[5],record.addressType,record.advType);
-    } else Serial.printf(",\"channel\":%u,\"frame_type\":\"%s\"", record.channel, frameType(record.bytes));
+    } else Serial.printf(",\"channel\":%u,\"frame_type\":\"%s\"", record.channel, record.headerOnly ? ((record.bytes[0]&12)==8 ? "data_header" : "management_header") : frameType(record.bytes));
+    if (record.headerOnly) Serial.print(",\"header_only\":true");
     Serial.print(",\"payload\":\"");
     char hex[MAX_BYTES * 2 + 1];
     const char* digits = "0123456789abcdef";
@@ -140,8 +160,10 @@ void health() {
 void status() {
   uint32_t count, lost, suppressed, recordLost, byteLost, invalidLost;
   unsigned peak, queued, bytes, peakBytes;
+  uint32_t hSeen,hSuppressed,hLimited,hQueued;
   portENTER_CRITICAL(&guard);
   count=seen; lost=dropped; suppressed=beaconSuppressed;
+  hSeen=headersSeen; hSuppressed=headersSuppressed; hLimited=headersLimited; hQueued=headersQueued;
   recordLost=droppedRecords; byteLost=droppedBytes; invalidLost=droppedInvalid;
   queued=pool.count(); peak=pool.peakCount(); bytes=pool.used(); peakBytes=pool.peakBytes();
   portEXIT_CRITICAL(&guard);
@@ -149,6 +171,8 @@ void status() {
   Serial.printf(",\"device_us\":%llu,\"seen\":%lu,\"dropped\":%lu,\"queued\":%u,\"beacon_suppressed\":%lu,\"queue_peak\":%u,\"queue_bytes\":%u,\"queue_bytes_peak\":%u,\"dropped_record_limit\":%lu,\"dropped_byte_limit\":%lu,\"dropped_invalid_length\":%lu",
     now(), (unsigned long)count, (unsigned long)lost, queued, (unsigned long)suppressed, peak, bytes, peakBytes,
     (unsigned long)recordLost, (unsigned long)byteLost, (unsigned long)invalidLost);
+  Serial.printf(",\"headers_seen\":%lu,\"headers_suppressed\":%lu,\"headers_limited\":%lu,\"headers_queued\":%lu",
+    (unsigned long)hSeen,(unsigned long)hSuppressed,(unsigned long)hLimited,(unsigned long)hQueued);
   health(); Serial.println("}");
 }
 void coverage(uint64_t end) {
@@ -198,12 +222,13 @@ void start() {
   accepting=false; pool.reset(); seen=0; dropped=0; beaconSuppressed=0;
   droppedRecords=0; droppedBytes=0; droppedInvalid=0;
   portEXIT_CRITICAL(&guard);
-  beaconSampler.reset(); stream=esp_random();
+  beaconSampler.reset(); headerSampler.reset();
+  headersSeen=headersSuppressed=headersLimited=headersQueued=0; stream=esp_random();
   channelIndex=0; bleWindow=false; windowOpen=false;
   wifi_init_config_t config=WIFI_INIT_CONFIG_DEFAULT();
   if (esp_wifi_init(&config) != ESP_OK) { error("Wi-Fi initialization failed"); return; }
   wifiReady=true;
-  wifi_promiscuous_filter_t filter{}; filter.filter_mask=WIFI_PROMIS_FILTER_MASK_MGMT;
+  wifi_promiscuous_filter_t filter{}; filter.filter_mask=WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA;
   if (esp_wifi_set_storage(WIFI_STORAGE_RAM) != ESP_OK ||
       esp_wifi_set_mode(WIFI_MODE_NULL) != ESP_OK || esp_wifi_start() != ESP_OK ||
       esp_wifi_set_promiscuous_filter(&filter) != ESP_OK ||
@@ -216,7 +241,7 @@ void start() {
   scan->setInterval(50); scan->setWindow(50); scan->setMaxResults(0); scan->setDuplicateFilter(0);
   if (!wifiWindow()) { release(); error("Cannot set passive Wi-Fi channel"); return; }
   running=true; acceptingSet(true); statusAt=now();
-  header("started"); Serial.printf(",\"mode\":\"passive-2.4-ble\",\"max_payload\":1024,\"wifi_frame_types\":[\"probe_request\",\"beacon\",\"probe_response\"],\"beacon_sample_ms\":5000,\"transport\":\"%s\"", TRANSPORT);
+  header("started"); Serial.printf(",\"mode\":\"passive-2.4-ble\",\"max_payload\":1024,\"wifi_frame_types\":[\"probe_request\",\"beacon\",\"probe_response\",\"management_header\",\"data_header\"],\"header_sample_ms\":1000,\"header_rate_limit\":100,\"beacon_sample_ms\":5000,\"transport\":\"%s\"", TRANSPORT);
   health(); Serial.println("}");
 }
 }  // namespace
@@ -226,7 +251,7 @@ bool command(const String& input) {
     String tx=input.substring(14);
     if (!tx.length() || tx.length()>40) return true;
     for (size_t i=0; i<tx.length(); ++i) if (!isAlphaNumeric(tx[i])) return true;
-    Serial.printf("@WARD:{\"v\":1,\"event\":\"capabilities\",\"tx\":\"%s\",\"passive\":true,\"wifi_probe\":true,\"wifi_beacon\":true,\"wifi_probe_response\":true,\"ble_advertisement\":true}\n", tx.c_str());
+    Serial.printf("@WARD:{\"v\":1,\"event\":\"capabilities\",\"tx\":\"%s\",\"passive\":true,\"wifi_probe\":true,\"wifi_beacon\":true,\"wifi_probe_response\":true,\"wifi_headers\":true,\"ble_advertisement\":true}\n", tx.c_str());
     return true;
   }
   if (input=="evidence start") { start(); return true; }

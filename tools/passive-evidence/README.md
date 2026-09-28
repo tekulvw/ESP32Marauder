@@ -51,3 +51,50 @@ Host evidence NDJSON includes original envelopes, parsed fields, rule version, m
 Native boundary test: `c++ -std=c++17 -Wall -Wextra -Werror tools/passive-evidence/test_packet.cpp -o /tmp/passive-packet-test && /tmp/passive-packet-test`
 
 Native pool boundary/wrap test: `c++ -std=c++17 -Wall -Wextra -Werror -fsanitize=undefined tools/passive-evidence/test_pool.cpp -o /tmp/passive-pool-test && /tmp/passive-pool-test`. It checks exact byte/count limits, failure without mutation, mixed lengths and wraparound against a reference FIFO, and the production 32 KiB/64-record/1,024-byte bounds.
+
+## Additional MAC-header capture
+
+New builds advertise `wifi_headers:true`. The `started.wifi_frame_types` list adds
+`management_header` and `data_header`, with `header_sample_ms:1000` and
+`header_rate_limit:100`. Update the host before flashing: older hosts reject these
+frame labels. Events remain `wifi`, and existing complete probe/beacon/response
+captures remain unchanged.
+
+Added management subtypes are association/reassociation requests/responses,
+disassociation, authentication, deauthentication, action and action-no-ack.
+Data frames include ordinary, null and QoS variants, protected or unprotected.
+Only the complete MAC header (24–36 bytes) is copied: no data/management body,
+encrypted payload, LLC, IP packet, or application content is retained by this
+extension. `header_only:true` distinguishes deliberate body omission from an
+accidentally shortened frame. `original_length` remains the received length
+without FCS; `truncated` remains true whenever bytes were omitted. Header-only
+frames cannot produce an IE/SSID fingerprint. Control/extension frames, reserved
+data subtype 13, nonzero versions, ordered management/non-QoS layouts, and mesh
+addressing are excluded. Frames reported by the driver as reception failures are
+ignored. This is an extension to the existing 2.4 GHz/BLE schedule, not continuous
+or lossless coverage of every Wi-Fi frame.
+
+A separate 64-entry 32-bit hash cache samples each address tuple/frame subtype/DS
+flags/channel at most once per second while cached. Sequence/retry, RSSI and QoS
+traffic identifiers do not bypass it. Cache eviction or a changed tuple can admit
+repeats; collisions can omit samples. At most 100 added headers are admitted per
+one-second rate window. Added headers are omitted when half the record slots are
+already occupied, reserving headroom for the original traffic classes. Both
+sampling and rate/queue-limit omissions precede sequence allocation. Only admitted
+samples update the cache. Headers still share the ordinary byte pool and its loss
+accounting.
+
+Status adds `headers_seen`, `headers_suppressed` (repeat sampling),
+`headers_limited` (rate or reserved-queue guard), and `headers_queued` (successful
+admission). These counters make intentional omission distinguishable from queue
+loss; they do not measure RF losses. A rejected pool push increments the usual
+`seen`/`dropped` counters and produces a sequence gap.
+
+Host decoding derives TA/RA/BSSID and source/destination from ToDS/FromDS bits,
+including four-address and QoS/+HTC lengths. RSSI and GPS observations always
+belong to TA. Recipient/BSSID prefix findings are weak indirect evidence, never
+recipient signal/location measurements. Remote source/destination addresses in
+bridged traffic do not become nearby-radio candidates. Candidates deduplicate a
+subject appearing in more than one role within a packet.
+
+Native header test: `c++ -std=c++17 -Wall -Wextra -Werror -fsanitize=undefined tools/passive-evidence/test_headers.cpp -o /tmp/passive-header-test && /tmp/passive-header-test`.
