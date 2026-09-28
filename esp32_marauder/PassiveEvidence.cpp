@@ -12,8 +12,11 @@ namespace passive_evidence {
 namespace {
 constexpr size_t MAX_BYTES = 1024;
 #if ARDUINO_USB_CDC_ON_BOOT
+constexpr unsigned QUEUE_CAPACITY = 40;
 constexpr const char* TRANSPORT = "usb_serial_jtag";
 #else
+// Bound the stop tail within the host deadline on the slower UART stream.
+constexpr unsigned QUEUE_CAPACITY = 32;
 constexpr const char* TRANSPORT = "uart0";
 #endif
 constexpr uint8_t CHANNELS[] = {11, 6, 1, 10, 9, 8, 7, 5, 4, 3, 2};
@@ -35,6 +38,7 @@ bool bleReady = false;
 bool bleWindow = false;
 bool windowOpen = false;
 uint32_t seen = 0, dropped = 0, beaconSuppressed = 0;
+unsigned queuePeak = 0;
 BeaconSampler beaconSampler;
 uint32_t stream = 0;
 uint64_t windowStart = 0, statusAt = 0;
@@ -57,7 +61,11 @@ void enqueue(Record& record) {
     } else {
       record.seq = ++seen;
       if (xQueueSend(queue, &record, 0) != pdTRUE) ++dropped;
-      else if (beacon) beaconSampler.remember(record.bytes+10, record.channel, record.beaconHash, record.us);
+      else {
+        unsigned depth = uxQueueMessagesWaiting(queue);
+        if (depth > queuePeak) queuePeak = depth;
+        if (beacon) beaconSampler.remember(record.bytes+10, record.channel, record.beaconHash, record.us);
+      }
     }
   }
   portEXIT_CRITICAL(&guard);
@@ -108,12 +116,23 @@ void drain(unsigned limit) {
     hex[record.len*2]=0; Serial.print(hex); Serial.println("\"}");
   }
 }
+void health() {
+  Serial.printf(",\"queue_capacity\":%u,\"queue_record_bytes\":%u,\"free_heap\":%lu,\"min_free_heap\":%lu,\"largest_free_block\":%lu,\"loop_stack_min_free\":%u",
+    QUEUE_CAPACITY, (unsigned)sizeof(Record), (unsigned long)ESP.getFreeHeap(),
+    (unsigned long)ESP.getMinFreeHeap(), (unsigned long)ESP.getMaxAllocHeap(),
+    (unsigned)uxTaskGetStackHighWaterMark(nullptr));
+}
 void status() {
   uint32_t count, lost, suppressed;
-  portENTER_CRITICAL(&guard); count=seen; lost=dropped; suppressed=beaconSuppressed; portEXIT_CRITICAL(&guard);
+  unsigned peak, queued;
+  portENTER_CRITICAL(&guard);
+  count=seen; lost=dropped; suppressed=beaconSuppressed; peak=queuePeak;
+  queued=uxQueueMessagesWaiting(queue);
+  portEXIT_CRITICAL(&guard);
   header("status");
-  Serial.printf(",\"device_us\":%llu,\"seen\":%lu,\"dropped\":%lu,\"queued\":%u,\"beacon_suppressed\":%lu}\n",
-    now(), (unsigned long)count, (unsigned long)lost, (unsigned)uxQueueMessagesWaiting(queue), (unsigned long)suppressed);
+  Serial.printf(",\"device_us\":%llu,\"seen\":%lu,\"dropped\":%lu,\"queued\":%u,\"beacon_suppressed\":%lu,\"queue_peak\":%u",
+    now(), (unsigned long)count, (unsigned long)lost, queued, (unsigned long)suppressed, peak);
+  health(); Serial.println("}");
 }
 void coverage(uint64_t end) {
   if (!windowOpen) return;
@@ -142,7 +161,7 @@ void release() {
 void stop() {
   if (!running) return;
   uint64_t end=now();
-  release(); coverage(end); drain(32); status();
+  release(); coverage(end); drain(QUEUE_CAPACITY); status();
   running=false;
   header("stopped"); Serial.println("}");
 }
@@ -158,9 +177,9 @@ void start() {
   }
   if (!wifi_scan_obj.resetBLEForEvidence()) { error("Cannot reset BLE state"); return; }
   wifi_scan_obj.shutdownWiFi();
-  if (!queue) queue=xQueueCreate(32, sizeof(Record));
+  if (!queue) queue=xQueueCreate(QUEUE_CAPACITY, sizeof(Record));
   if (!queue) { error("Cannot allocate evidence queue"); return; }
-  xQueueReset(queue); seen=0; dropped=0; beaconSuppressed=0; beaconSampler.reset(); stream=esp_random();
+  xQueueReset(queue); queuePeak=0; seen=0; dropped=0; beaconSuppressed=0; beaconSampler.reset(); stream=esp_random();
   channelIndex=0; bleWindow=false; windowOpen=false;
   wifi_init_config_t config=WIFI_INIT_CONFIG_DEFAULT();
   if (esp_wifi_init(&config) != ESP_OK) { error("Wi-Fi initialization failed"); return; }
@@ -178,7 +197,8 @@ void start() {
   scan->setInterval(50); scan->setWindow(50); scan->setMaxResults(0); scan->setDuplicateFilter(0);
   if (!wifiWindow()) { release(); error("Cannot set passive Wi-Fi channel"); return; }
   running=true; acceptingSet(true); statusAt=now();
-  header("started"); Serial.printf(",\"mode\":\"passive-2.4-ble\",\"max_payload\":1024,\"wifi_frame_types\":[\"probe_request\",\"beacon\",\"probe_response\"],\"beacon_sample_ms\":5000,\"transport\":\"%s\"}\n", TRANSPORT);
+  header("started"); Serial.printf(",\"mode\":\"passive-2.4-ble\",\"max_payload\":1024,\"wifi_frame_types\":[\"probe_request\",\"beacon\",\"probe_response\"],\"beacon_sample_ms\":5000,\"transport\":\"%s\"", TRANSPORT);
+  health(); Serial.println("}");
 }
 }  // namespace
 bool active() { return running; }
