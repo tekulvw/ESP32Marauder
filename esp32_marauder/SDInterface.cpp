@@ -1,6 +1,11 @@
 #include "SDInterface.h"
 #include "lang_var.h"
 
+#ifdef MARAUDER_C5
+  #include "esp_private/periph_ctrl.h"
+  #include "hal/spi_ll.h"
+#endif
+
 // GCOVR_EXCL_START -- requires mounted SPIFFS and SD filesystems.
 namespace {
   bool removeTree(fs::FS& fs, const String& path, bool keep_root = false) {
@@ -136,6 +141,25 @@ bool SDInterface::initSD() {
     #endif
 
     pinMode(SD_CS, OUTPUT);
+    #ifdef MARAUDER_C5
+      digitalWrite(SD_CS, HIGH);
+      if (!_spi->bus()) {
+        // Arduino 3.3.4 omits the C5 clock/reset branch in spiStartBus().
+        // Initialize SPI2 immediately before use, rather than relying on ROM
+        // or other startup code to have left this peripheral enabled.
+        PERIPH_RCC_ATOMIC() {
+          spi_ll_enable_bus_clock(SPI2_HOST, true);
+          spi_ll_reset_register(SPI2_HOST);
+          spi_ll_enable_clock(SPI2_HOST, true);
+        }
+        if (!_spi->begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS)) {
+          _spi->end();
+          Serial.println(F("Failed to initialize SD SPI bus"));
+          this->supported = false;
+          return false;
+        }
+      }
+    #endif
 
     delay(10);
     #if (defined(MARAUDER_M5STICKC)) || (defined(HAS_CYD_TOUCH)) || (defined(MARAUDER_CARDPUTER)) || (defined(MARAUDER_CARDPUTER_ADV))

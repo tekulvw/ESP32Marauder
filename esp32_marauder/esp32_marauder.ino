@@ -229,7 +229,11 @@ uint32_t currentTime  = 0;
 #endif
 
 #ifdef HAS_C5_SD
-  SPIClass sharedSPI(SPI);
+  #ifdef MARAUDER_C5
+    SPIClass sharedSPI(FSPI);
+  #else
+    SPIClass sharedSPI(SPI);
+  #endif
   SDInterface sd_obj = SDInterface(&sharedSPI, SD_CS);
 #endif
 
@@ -262,7 +266,7 @@ void setup()
   while(!Serial)
     delay(10);
 
-  #ifdef HAS_C5_SD
+  #if defined(HAS_C5_SD) && !defined(MARAUDER_C5)
     sharedSPI.begin(SD_SCK, SD_MISO, SD_MOSI);
     delay(100);
   #endif
