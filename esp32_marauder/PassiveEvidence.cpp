@@ -3,7 +3,7 @@
 #include "PassiveEvidence.h"
 #include "EvidencePacket.h"
 #include "WiFiScan.h"
-#include <freertos/queue.h>
+#include "EvidencePool.h"
 #include <esp_random.h>
 
 extern WiFiScan wifi_scan_obj;
@@ -12,7 +12,7 @@ namespace passive_evidence {
 namespace {
 constexpr size_t MAX_BYTES = 1024;
 #if ARDUINO_USB_CDC_ON_BOOT
-constexpr unsigned QUEUE_CAPACITY = 40;
+constexpr unsigned QUEUE_CAPACITY = 64;
 constexpr const char* TRANSPORT = "usb_serial_jtag";
 #else
 // Bound the stop tail within the host deadline on the slower UART stream.
@@ -20,16 +20,19 @@ constexpr unsigned QUEUE_CAPACITY = 32;
 constexpr const char* TRANSPORT = "uart0";
 #endif
 constexpr uint8_t CHANNELS[] = {11, 6, 1, 10, 9, 8, 7, 5, 4, 3, 2};
-struct Record {
+constexpr size_t POOL_BYTES = 32 * 1024;
+struct RecordHeader {
   uint64_t us;
   uint32_t seq, beaconHash;
   uint16_t len, original;
   int8_t rssi;
   uint8_t radio, channel, addressType, advType;
   uint8_t mac[6];
-  uint8_t bytes[MAX_BYTES];
+  uint8_t reserved;
 };
-QueueHandle_t queue = nullptr;
+struct Record : RecordHeader { uint8_t bytes[MAX_BYTES]; };
+using EvidencePool = PacketPool<RecordHeader, POOL_BYTES, QUEUE_CAPACITY, MAX_BYTES>;
+EvidencePool pool;
 portMUX_TYPE guard = portMUX_INITIALIZER_UNLOCKED;
 bool running = false;
 bool accepting = false;
@@ -38,7 +41,7 @@ bool bleReady = false;
 bool bleWindow = false;
 bool windowOpen = false;
 uint32_t seen = 0, dropped = 0, beaconSuppressed = 0;
-unsigned queuePeak = 0;
+uint32_t droppedRecords = 0, droppedBytes = 0, droppedInvalid = 0;
 BeaconSampler beaconSampler;
 uint32_t stream = 0;
 uint64_t windowStart = 0, statusAt = 0;
@@ -60,11 +63,14 @@ void enqueue(Record& record) {
       ++beaconSuppressed;
     } else {
       record.seq = ++seen;
-      if (xQueueSend(queue, &record, 0) != pdTRUE) ++dropped;
-      else {
-        unsigned depth = uxQueueMessagesWaiting(queue);
-        if (depth > queuePeak) queuePeak = depth;
-        if (beacon) beaconSampler.remember(record.bytes+10, record.channel, record.beaconHash, record.us);
+      PoolPush result = pool.push(record, record.bytes, record.len);
+      if (result != PoolPush::Accepted) {
+        ++dropped;
+        if (result == PoolPush::RecordLimit) ++droppedRecords;
+        else if (result == PoolPush::ByteLimit) ++droppedBytes;
+        else ++droppedInvalid;
+      } else if (beacon) {
+        beaconSampler.remember(record.bytes+10, record.channel, record.beaconHash, record.us);
       }
     }
   }
@@ -100,7 +106,11 @@ class Callbacks : public NimBLEScanCallbacks {
 Callbacks callbacks;
 void drain(unsigned limit) {
   Record record;
-  while (limit-- && xQueueReceive(queue, &record, 0) == pdTRUE) {
+  while (limit--) {
+    portENTER_CRITICAL(&guard);
+    bool available = pool.pop(record, record.bytes, sizeof(record.bytes));
+    portEXIT_CRITICAL(&guard);
+    if (!available) break;
     header(record.radio ? "ble" : "wifi");
     Serial.printf(",\"seq\":%lu,\"capture_us\":%llu,\"sent_us\":%llu,\"rssi\":%d,\"original_length\":%u,\"truncated\":%s",
       (unsigned long)record.seq, record.us, now(), record.rssi, record.original,
@@ -117,21 +127,23 @@ void drain(unsigned limit) {
   }
 }
 void health() {
-  Serial.printf(",\"queue_capacity\":%u,\"queue_record_bytes\":%u,\"free_heap\":%lu,\"min_free_heap\":%lu,\"largest_free_block\":%lu,\"loop_stack_min_free\":%u",
-    QUEUE_CAPACITY, (unsigned)sizeof(Record), (unsigned long)ESP.getFreeHeap(),
+  Serial.printf(",\"queue_capacity\":%u,\"queue_pool_bytes\":%u,\"queue_record_header_bytes\":%u,\"free_heap\":%lu,\"min_free_heap\":%lu,\"largest_free_block\":%lu,\"loop_stack_min_free\":%u",
+    QUEUE_CAPACITY, (unsigned)POOL_BYTES, (unsigned)EvidencePool::HEADER_BYTES, (unsigned long)ESP.getFreeHeap(),
     (unsigned long)ESP.getMinFreeHeap(), (unsigned long)ESP.getMaxAllocHeap(),
     (unsigned)uxTaskGetStackHighWaterMark(nullptr));
 }
 void status() {
-  uint32_t count, lost, suppressed;
-  unsigned peak, queued;
+  uint32_t count, lost, suppressed, recordLost, byteLost, invalidLost;
+  unsigned peak, queued, bytes, peakBytes;
   portENTER_CRITICAL(&guard);
-  count=seen; lost=dropped; suppressed=beaconSuppressed; peak=queuePeak;
-  queued=uxQueueMessagesWaiting(queue);
+  count=seen; lost=dropped; suppressed=beaconSuppressed;
+  recordLost=droppedRecords; byteLost=droppedBytes; invalidLost=droppedInvalid;
+  queued=pool.count(); peak=pool.peakCount(); bytes=pool.used(); peakBytes=pool.peakBytes();
   portEXIT_CRITICAL(&guard);
   header("status");
-  Serial.printf(",\"device_us\":%llu,\"seen\":%lu,\"dropped\":%lu,\"queued\":%u,\"beacon_suppressed\":%lu,\"queue_peak\":%u",
-    now(), (unsigned long)count, (unsigned long)lost, queued, (unsigned long)suppressed, peak);
+  Serial.printf(",\"device_us\":%llu,\"seen\":%lu,\"dropped\":%lu,\"queued\":%u,\"beacon_suppressed\":%lu,\"queue_peak\":%u,\"queue_bytes\":%u,\"queue_bytes_peak\":%u,\"dropped_record_limit\":%lu,\"dropped_byte_limit\":%lu,\"dropped_invalid_length\":%lu",
+    now(), (unsigned long)count, (unsigned long)lost, queued, (unsigned long)suppressed, peak, bytes, peakBytes,
+    (unsigned long)recordLost, (unsigned long)byteLost, (unsigned long)invalidLost);
   health(); Serial.println("}");
 }
 void coverage(uint64_t end) {
@@ -177,9 +189,11 @@ void start() {
   }
   if (!wifi_scan_obj.resetBLEForEvidence()) { error("Cannot reset BLE state"); return; }
   wifi_scan_obj.shutdownWiFi();
-  if (!queue) queue=xQueueCreate(QUEUE_CAPACITY, sizeof(Record));
-  if (!queue) { error("Cannot allocate evidence queue"); return; }
-  xQueueReset(queue); queuePeak=0; seen=0; dropped=0; beaconSuppressed=0; beaconSampler.reset(); stream=esp_random();
+  portENTER_CRITICAL(&guard);
+  accepting=false; pool.reset(); seen=0; dropped=0; beaconSuppressed=0;
+  droppedRecords=0; droppedBytes=0; droppedInvalid=0;
+  portEXIT_CRITICAL(&guard);
+  beaconSampler.reset(); stream=esp_random();
   channelIndex=0; bleWindow=false; windowOpen=false;
   wifi_init_config_t config=WIFI_INIT_CONFIG_DEFAULT();
   if (esp_wifi_init(&config) != ESP_OK) { error("Wi-Fi initialization failed"); return; }
