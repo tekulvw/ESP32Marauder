@@ -1,3 +1,6 @@
+#ifdef MARAUDER_C5
+#include "PassiveEvidence.h"
+#endif
 /* FLASH SETTINGS
 Board: LOLIN D32
  Frequency: 80MHz
@@ -446,8 +449,15 @@ void loop()
 
   // Update all of our objects
   cli_obj.main(currentTime);
-  wifi_scan_obj.main(currentTime);
-  recon_obj.main(currentTime);
+  #ifdef MARAUDER_C5
+  if (passive_evidence::active()) passive_evidence::tick();
+  else {
+  #endif
+    wifi_scan_obj.main(currentTime);
+    recon_obj.main(currentTime);
+  #ifdef MARAUDER_C5
+  }
+  #endif
 
   #ifdef HAS_T_DONGLE_DISPLAY
     t_dongle_display.update(currentTime, wifi_scan_obj);

@@ -1,3 +1,6 @@
+#ifdef MARAUDER_C5
+#include "PassiveEvidence.h"
+#endif
 #include "CommandLine.h"
 
 // GCOVR_EXCL_START -- serial protocol output depends on Arduino Serial.
@@ -262,6 +265,9 @@ void CommandLine::startScanFromCLI(int scan_mode, uint16_t color, const char* sc
 
 void CommandLine::runCommand(String input) {
   if (input == "") return;
+  #ifdef MARAUDER_C5
+    if (passive_evidence::command(input)) return;
+  #endif
 
   if(wifi_scan_obj.scanning() && wifi_scan_obj.currentScanMode == WIFI_SCAN_GPS_NMEA){
     if(input != STOPSCAN_CMD) return;    

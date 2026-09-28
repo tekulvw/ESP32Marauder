@@ -1096,6 +1096,9 @@ class WiFiScan
     int generateSSIDs(int count = 20);
     bool shutdownWiFi();
     bool shutdownBLE();
+    #ifdef MARAUDER_C5
+      bool resetBLEForEvidence();
+    #endif
     bool scanning();
     bool joinWiFi(String ssid, String password, bool gui = true, bool save_credential = true);
     bool joinSavedWiFi(bool gui = true);

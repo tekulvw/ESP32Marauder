@@ -1965,7 +1965,12 @@ void WiFiScan::RunSetup() {
       esp_wifi_set_country(&country);
       esp_event_loop_create_default();
     #endif
-    esp_wifi_set_mode(WIFI_AP_STA);
+    // C5 evidence build: do not enable a SoftAP during startup.
+    #ifdef MARAUDER_C5
+      esp_wifi_set_mode(WIFI_MODE_NULL);
+    #else
+      esp_wifi_set_mode(WIFI_AP_STA);
+    #endif
     esp_wifi_start();
     this->wifi_initialized = true;
     esp_wifi_get_mac(WIFI_IF_STA, this->sta_mac);
@@ -2950,6 +2955,21 @@ bool WiFiScan::shutdownWiFi() {
     return false;
   }
 }
+
+#ifdef MARAUDER_C5
+bool WiFiScan::resetBLEForEvidence() {
+  this->shutdownBLE();
+  // A retained indefinite advertiser can restart on host resynchronization.
+  // Stop the host successfully before destroying shared objects/pointers.
+  if (!NimBLEDevice::deinit(false)) return false;
+  NimBLEDevice::deinit(true);
+  pAdvertising = nullptr;
+  pBLEScan = nullptr;
+  nimbleClient = nullptr;
+  this->ble_initialized = false;
+  return true;
+}
+#endif
 
 bool WiFiScan::shutdownBLE() {
   #ifdef HAS_BT
