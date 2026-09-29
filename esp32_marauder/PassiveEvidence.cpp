@@ -2,6 +2,7 @@
 #ifdef MARAUDER_C5
 #include "PassiveEvidence.h"
 #include "EvidencePacket.h"
+#include "EvidenceProfile.h"
 #include "WiFiScan.h"
 #include "EvidencePool.h"
 #include <esp_random.h>
@@ -21,7 +22,7 @@ constexpr const char* TRANSPORT = "usb_serial_jtag";
 constexpr unsigned QUEUE_CAPACITY = 32;
 constexpr const char* TRANSPORT = "uart0";
 #endif
-constexpr uint8_t CHANNELS[] = {11, 6, 1, 10, 9, 8, 7, 5, 4, 3, 2};
+ScanProfile profile;
 constexpr size_t POOL_BYTES = 32 * 1024;
 struct RecordHeader {
   uint64_t us;
@@ -180,7 +181,7 @@ void coverage(uint64_t end) {
   windowOpen=false;
   header("coverage");
   Serial.printf(",\"radio\":\"%s\",\"channel\":%u,\"start_us\":%llu,\"end_us\":%llu}\n",
-    bleWindow ? "BLE" : "WIFI", bleWindow ? 0 : CHANNELS[channelIndex], windowStart, end);
+    bleWindow ? "BLE" : "WIFI", bleWindow ? 0 : profile.channels[channelIndex], windowStart, end);
 }
 void acceptingSet(bool value) {
   portENTER_CRITICAL(&guard); accepting=value; portEXIT_CRITICAL(&guard);
@@ -207,11 +208,17 @@ void stop() {
   header("stopped"); Serial.println("}");
 }
 bool wifiWindow() {
-  if (esp_wifi_set_channel(CHANNELS[channelIndex], WIFI_SECOND_CHAN_NONE) != ESP_OK) return false;
+  if (esp_wifi_set_channel(profile.channels[channelIndex], WIFI_SECOND_CHAN_NONE) != ESP_OK) return false;
   if (esp_wifi_set_promiscuous(true) != ESP_OK) return false;
   windowStart=now(); windowOpen=true; return true;
 }
-void start() {
+void profileFields() {
+  Serial.printf(",\"profile\":\"%s\",\"wifi_dwell_ms\":%u,\"ble_window_ms\":%u,\"channels\":[",
+    profile.name(), profile.wifiDwellMs, profile.bleWindowMs);
+  for (unsigned i=0; i<profile.count; ++i) Serial.printf("%s%u", i ? "," : "", profile.channels[i]);
+  Serial.print("]");
+}
+void start(const ScanProfile& requested) {
   if (running) { error("Evidence capture is already running"); return; }
   if (wifi_scan_obj.currentScanMode != WIFI_SCAN_OFF || wifi_scan_obj.wifi_connected) {
     error("Stop other scans and disconnect Wi-Fi before evidence capture"); return;
@@ -224,7 +231,9 @@ void start() {
   portEXIT_CRITICAL(&guard);
   beaconSampler.reset(); headerSampler.reset();
   headersSeen=headersSuppressed=headersLimited=headersQueued=0; stream=esp_random();
-  channelIndex=0; bleWindow=false; windowOpen=false;
+  profile=requested;
+  channelIndex=0; bleWindow=firstWindow(profile).ble; windowOpen=false;
+  if (profile.count) {
   wifi_init_config_t config=WIFI_INIT_CONFIG_DEFAULT();
   if (esp_wifi_init(&config) != ESP_OK) { error("Wi-Fi initialization failed"); return; }
   wifiReady=true;
@@ -235,14 +244,21 @@ void start() {
       esp_wifi_set_promiscuous_rx_cb(wifiCallback) != ESP_OK) {
     release(); error("Cannot configure passive Wi-Fi capture"); return;
   }
+  }
+  if (profile.bleWindowMs) {
   if (!NimBLEDevice::init("")) { release(); error("BLE initialization failed"); return; }
   bleReady=true; scan=NimBLEDevice::getScan();
   scan->setScanCallbacks(&callbacks, true); scan->setActiveScan(false);
   scan->setInterval(50); scan->setWindow(50); scan->setMaxResults(0); scan->setDuplicateFilter(0);
-  if (!wifiWindow()) { release(); error("Cannot set passive Wi-Fi channel"); return; }
+  }
+  bool ready;
+  if (bleWindow) {
+    ready=scan->start(0, false, true); windowStart=now(); windowOpen=ready;
+  } else ready=wifiWindow();
+  if (!ready) { release(); error("Cannot start passive radio window"); return; }
   running=true; acceptingSet(true); statusAt=now();
   header("started"); Serial.printf(",\"mode\":\"passive-2.4-ble\",\"max_payload\":1024,\"wifi_frame_types\":[\"probe_request\",\"beacon\",\"probe_response\",\"management_header\",\"data_header\"],\"header_sample_ms\":1000,\"header_rate_limit\":100,\"beacon_sample_ms\":5000,\"transport\":\"%s\"", TRANSPORT);
-  health(); Serial.println("}");
+  profileFields(); health(); Serial.println("}");
 }
 }  // namespace
 bool active() { return running; }
@@ -251,10 +267,16 @@ bool command(const String& input) {
     String tx=input.substring(14);
     if (!tx.length() || tx.length()>40) return true;
     for (size_t i=0; i<tx.length(); ++i) if (!isAlphaNumeric(tx[i])) return true;
-    Serial.printf("@WARD:{\"v\":1,\"event\":\"capabilities\",\"tx\":\"%s\",\"passive\":true,\"wifi_probe\":true,\"wifi_beacon\":true,\"wifi_probe_response\":true,\"wifi_headers\":true,\"ble_advertisement\":true}\n", tx.c_str());
+    Serial.printf("@WARD:{\"v\":1,\"event\":\"capabilities\",\"tx\":\"%s\",\"passive\":true,\"wifi_probe\":true,\"wifi_beacon\":true,\"wifi_probe_response\":true,\"wifi_headers\":true,\"ble_advertisement\":true,\"scan_profiles\":true}\n", tx.c_str());
     return true;
   }
-  if (input=="evidence start") { start(); return true; }
+  if (input=="evidence start" || input.startsWith("evidence start ")) {
+    ScanProfile requested;
+    if (!parseProfile(input.length()==14 ? "" : input.c_str()+15, requested)) {
+      error("Invalid scan profile: use survey|wifi-only|focused|fixed|ble-only, dwell 50..1000, unique channels 1..11");
+    } else start(requested);
+    return true;
+  }
   if (input=="evidence stop" || (running && input=="stopscan")) { stop(); return true; }
   if (running && input!="gps -g nmea" && !input.startsWith("protocolinfo ")) {
     error("Stop evidence capture before other commands"); return true;
@@ -266,19 +288,24 @@ void tick() {
   // Bound each batch by elapsed time and count, then return to commands/GPS.
   drain(DRAIN_PACKET_LIMIT, DRAIN_BUDGET_US);
   uint64_t current=now();
-  if (current-windowStart >= (bleWindow ? 500000 : 250000)) {
-    acceptingSet(false);
-    if (bleWindow) scan->stop(); else esp_wifi_set_promiscuous(false);
-    coverage(now());
-    bool ok;
-    if (bleWindow) { bleWindow=false; channelIndex=0; ok=wifiWindow(); }
-    else if (++channelIndex < sizeof(CHANNELS)) ok=wifiWindow();
-    else {
-      bleWindow=true; channelIndex=0;
-      ok=scan->start(0, false, true); windowStart=now(); windowOpen=ok;
+  if (current-windowStart >= windowDurationUs(profile, {bleWindow, channelIndex})) {
+    ScanWindow next=nextWindow(profile, {bleWindow, channelIndex});
+    // Fixed-channel and BLE-only capture stay enabled across reporting boundaries.
+    // A one-channel focused profile uses the same continuous receive path.
+    if (next.ble==bleWindow && next.index==channelIndex) {
+      coverage(current); windowStart=current; windowOpen=true;
+    } else {
+      acceptingSet(false);
+      if (bleWindow) scan->stop(); else esp_wifi_set_promiscuous(false);
+      coverage(now());
+      bleWindow=next.ble; channelIndex=next.index;
+      bool ok;
+      if (bleWindow) {
+        ok=scan->start(0, false, true); windowStart=now(); windowOpen=ok;
+      } else ok=wifiWindow();
+      if (!ok) { error("Radio window transition failed"); stop(); return; }
+      acceptingSet(true);
     }
-    if (!ok) { error("Radio window transition failed"); stop(); return; }
-    acceptingSet(true);
   }
   if (current-statusAt>=2000000) { status(); statusAt=current; }
 }
